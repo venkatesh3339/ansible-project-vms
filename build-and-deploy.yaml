@@ -1,0 +1,90 @@
+name:  CI/CD for Databricks that deploys .whl artifacts to external volumes
+
+on:
+  push:
+    branches:
+      - main  # Production environment
+      - qa    # QA environment
+      - dev   # Development environment
+      - 'feature/*' # Feature branches
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+
+jobs:
+  deploy:
+    runs-on: [uhg-runner]
+
+    environment:
+      name: ${{ github.ref_name == 'main' && 'production' || github.ref_name == 'qa' && 'qa' ||  github.ref_name == 'dev' && 'dev' || startsWith(github.ref_name, 'feature/') && 'dev' }}
+
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v3
+      with:
+          python-version: '3.12'
+
+    - name: Set environment variables from GitHub Environment Secrets
+      run: |
+        echo "AZURE_CLIENT_ID=${{ secrets.AZURE_CLIENT_ID }}" >> $GITHUB_ENV
+        echo "AZURE_TENANT_ID=${{ secrets.AZURE_TENANT_ID }}" >> $GITHUB_ENV
+        echo "AZURE_CLIENT_SECRET=${{ secrets.AZURE_CLIENT_SECRET }}" >> $GITHUB_ENV
+
+    # - name: Set up Java 21
+    #   uses: actions/setup-java@v4
+    #   with:
+    #     distribution: 'zulu' # See 'Supported distributions' for available options
+    #     java-version: '21'
+    # - name: Verify Java installation
+    #   run: |
+    #         java -version
+    #         echo "JAVA_HOME:"$JAVA_HOME
+    - name: Install Poetry
+      run: |
+        curl -sSL https://install.python-poetry.org | python3 -
+        echo `export PATH="/home/runner/.local/bin:$PATH"` >> $GITHUB_ENV
+        source $GITHUB_ENV
+        /home/runner/.local/bin/poetry --version
+
+    - name: Install dependencies with Poetry
+      run: |
+        /home/runner/.local/bin/poetry install
+
+    # - name: Run unit tests
+    #   run: |
+    #     /home/runner/.local/bin/poetry run tox
+
+    - name: Build the .whl package with Poetry
+      run: |
+        /home/runner/.local/bin/poetry build
+
+    - name: Upload .whl file to Databricks
+      env:
+            DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+            ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+            ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+            ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+            PROJECT_NAME: "blue_de_ingestion"
+            DATABRICKS_VOLUME: ${{ vars.DATABRICKS_VOLUME }}
+      run: |
+        curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sudo sh
+        databricks -v
+        WHL_FILE=$(ls dist/*.whl)
+        echo $WHL_FILE
+        echo $DATABRICKS_VOLUME
+        TARGET_VOLUME_PATH="$DATABRICKS_VOLUME/$PROJECT_NAME/${{ github.ref_name }}"
+        databricks fs mkdirs $TARGET_VOLUME_PATH
+        echo $TARGET_VOLUME_PATH
+        databricks fs cp $WHL_FILE $TARGET_VOLUME_PATH --overwrite
+        WHL_FILE_LATEST="dist/${PROJECT_NAME}_latest.whl"
+        mv "$WHL_FILE" "$WHL_FILE_LATEST"
+        databricks fs cp $WHL_FILE_LATEST $TARGET_VOLUME_PATH --overwrite
+        echo "Verifying deployment at $DATABRICKS_HOST"
+        databricks fs ls $TARGET_VOLUME_PATH
